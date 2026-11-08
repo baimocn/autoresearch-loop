@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "agent handoff",
+  "type": "object",
+  "required": ["role", "round", "input_sha256", "status", "output_paths", "commands_run"],
+  "properties": {
+    "agent_id": {"type": "string"},
+    "role": {"enum": ["qa_manager", "shard_worker", "repair"]},
+    "round": {"type": "integer", "minimum": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status": {"enum": ["done", "incomplete", "blocked"]},
+    "execution_mode": {"enum": ["subagents", "serial_fallback", "mixed"]},
+    "shards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "coverage_pct", "complete"],
+        "properties": {
+          "id": {"type": "string"},
+          "coverage_pct": {"type": "number", "minimum": 0, "maximum": 100},
+          "complete": {"type": "boolean"},
+          "mode": {"enum": ["subagent", "serial_fallback"]}
+        }
+      }
+    },
+    "output_paths": {"type": "array", "items": {"type": "string"}},
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cmd", "rc"],
+        "properties": {"cmd": {"type": "string"}, "rc": {"type": "integer"}}
+      }
+    },
+    "output_zip": {"type": "string"},
+    "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scope_fixed": {"type": "array", "items": {"type": "string"}},
+    "not_fixed": {"type": "array", "items": {"type": "string"}},
+    "platform_scope": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string"}
+  }
+}
