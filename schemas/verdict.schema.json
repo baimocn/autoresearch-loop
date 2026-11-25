@@ -1,13 +1,15 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "qa verdict",
+  "description": "v2.7 结论二态：只有 PASS / FAIL。PASS_WITH_WAIVERS、PASS_WITH_OPEN、INCOMPLETE 已废止，不再作为结论。",
   "type": "object",
-  "required": ["task", "round", "input_sha256", "decision", "blocking_count", "major_count", "minor_count", "key_findings"],
+  "required": ["task", "round", "input_sha256", "decision", "blocking_count", "major_count", "minor_count", "key_findings", "mechanical_checks"],
   "properties": {
     "task": {"type": "string"},
     "round": {"type": "integer", "minimum": 1},
     "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "decision": {"enum": ["PASS", "PASS_WITH_WAIVERS", "FAIL", "INCOMPLETE"]},
+    "standard_version": {"type": "string", "description": "本次对照的标准版本，如 adversarial-engineering-qa v2.7.0"},
+    "decision": {"enum": ["PASS", "FAIL"]},
     "blocking_count": {"type": "integer", "minimum": 0},
     "major_count": {"type": "integer", "minimum": 0},
     "minor_count": {"type": "integer", "minimum": 0},
@@ -22,11 +24,36 @@
           "file": {"type": "string"},
           "line": {"type": "integer", "minimum": 0},
           "summary": {"type": "string"},
-          "evidence": {"type": "string"}
+          "evidence": {"type": "string", "description": "file:line + 原文引用，或可复现命令与原始输出"},
+          "class": {
+            "enum": ["difficulty_low", "difficulty_high", "failure_as_zero", "verifier_budget", "contract_anticheat", "build_delivery", "oracle_solution", "reward_contract", "other"],
+            "description": "对应终检问题汇总的五类 + 交付/Oracle/reward 合同类"
+          },
+          "responsible": {"enum": ["expert", "platform", "joint", "qa_tool"], "description": "责任归属：专家侧/平台侧/双方/质检端"}
         }
       }
     },
+    "mechanical_checks": {
+      "type": "object",
+      "description": "机械门禁产物路径，相对 verdict 所在目录。current_standard_gate 必填；旧三件套仅兼容。",
+      "required": ["current_standard_gate"],
+      "properties": {
+        "current_standard_gate": {"type": "string"},
+        "shipping_limits": {"type": "string", "description": "PASS 必需；有 fail 项时 PASS 不成立"},
+        "honest_candidate": {"type": "string"},
+        "return_contracts": {"type": "string"},
+        "platform_rules": {"type": "string"},
+        "delivery_contract": {"type": "string"},
+        "execution_path": {"type": "string"}
+      }
+    },
+    "failure_classes": {
+      "type": "object",
+      "description": "五类终检问题的命中计数，便于按类归并返修",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
     "residual_risks": {"type": "array", "items": {"type": "string"}},
-    "platform_scope": {"type": "array", "items": {"type": "string"}}
+    "platform_scope": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string"}
   }
 }

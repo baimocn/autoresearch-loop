@@ -29,13 +29,18 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
-DEFAULT_SKILL = r"D:\Desktop\论文最新包\adversarial-engineering-qa-v2.3.1\adversarial-engineering-qa"
-PASS_DECISIONS = {"PASS", "PASS_WITH_WAIVERS"}
+SCHEMA_VERSION = 2
+DEFAULT_SKILL = os.environ.get("AUTORESEARCH_QA_SKILL") or str(
+    Path(__file__).resolve().parent.parent / "adversarial-engineering-qa")
+DECISIONS = {"PASS", "FAIL"}
+PASS_DECISIONS = {"PASS"}
+# v2.7 起官方结论二态：PASS_WITH_WAIVERS / PASS_WITH_OPEN / INCOMPLETE 不再作为结论。
+RETIRED_DECISIONS = {"PASS_WITH_WAIVERS", "PASS_WITH_OPEN", "INCOMPLETE", "QA_NOT_FINISHED"}
 
 
 def now() -> str:
@@ -98,9 +103,9 @@ def prompt_path(root: Path, name: str) -> Path:
 
 
 def write_template_tree(root: Path) -> None:
-    """把本文件同目录的 prompts/ 与 schemas/ 复制进循环根，保证闭环自包含。"""
+    """把本文件同目录的 prompts/、schemas/、scripts/ 复制进循环根，保证闭环自包含。"""
     here = Path(__file__).resolve().parent
-    for sub in ("prompts", "schemas"):
+    for sub in ("prompts", "schemas", "scripts"):
         src = here / sub
         dst = root / sub
         if src.is_dir():
@@ -113,7 +118,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     if not zip_path.is_file():
         die(f"输入包不存在：{zip_path}")
     root = Path(args.root).resolve() if args.root else (
-        Path(r"D:\Desktop\论文最新包\loop") / args.task)
+        Path.cwd() / "loop" / args.task)
     if state_path(root).exists() and not args.force:
         die(f"{root} 已有 state.json；确需重建请加 --force")
     root.mkdir(parents=True, exist_ok=True)
@@ -137,6 +142,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "task": args.task,
         "root": str(root),
         "skill_dir": args.skill_dir or DEFAULT_SKILL,
+        "standard": args.standard,
         "max_rounds": args.max_rounds,
         "shard_count": args.shard_count,
         "round": 1,
@@ -171,6 +177,7 @@ def cmd_next(args: argparse.Namespace) -> None:
         "REPAIR_DIR": str(round_dir(root, st["round"]) / "repair"),
         "SHARD_COUNT": st["shard_count"],
         "SKILL_DIR": st["skill_dir"],
+        "STANDARD": st.get("standard", ""),
         "ROOT": str(root),
         "VERDICT_PATH": str(round_dir(root, st["round"]) / "qa" / "verdict.json"),
         "HANDOFF_PATH": str(round_dir(root, st["round"]) / "qa" / "handoff.json"),
@@ -266,16 +273,85 @@ def _validate_shards(qa_dir: Path, decision: str) -> list[dict]:
     return rows
 
 
-def _validate_mechanical(verdict: dict, qa_dir: Path) -> None:
+LEGACY_GATE_KEYS = ("platform_rules", "delivery_contract", "execution_path")
+OPTIONAL_GATE_KEYS = ("shipping_limits", "honest_candidate", "return_contracts")
+
+
+def _gate_passed(obj: dict) -> bool | None:
+    """从门禁产物里读二态结论；读不出返回 None（不许当作通过）。"""
+    for key in ("passed", "ok", "pass"):
+        if isinstance(obj.get(key), bool):
+            return obj[key]
+    decision = obj.get("decision")
+    if isinstance(decision, str):
+        up = decision.strip().upper()
+        if up in ("PASS", "FAIL"):
+            return up == "PASS"
+    return None
+
+
+def _validate_mechanical(verdict: dict, qa_dir: Path) -> tuple[bool | None, bool | None]:
+    """v2.7 唯一机械入口是 current_standard_gate；旧三件套仅作兼容。
+
+    返回 (gate_passed, shipping_ok)，None 表示没有该产物。
+    """
     mc = verdict.get("mechanical_checks")
     if not isinstance(mc, dict):
-        die("verdict 缺少 mechanical_checks（三组机械门禁的产物路径）")
-    for key in ("platform_rules", "delivery_contract", "execution_path"):
+        die("verdict 缺少 mechanical_checks（current_standard_gate 的产物路径）")
+
+    paths: dict[str, Path] = {}
+    if "current_standard_gate" in mc:
+        keys = ["current_standard_gate"]
+    elif all(k in mc for k in LEGACY_GATE_KEYS):
+        keys = list(LEGACY_GATE_KEYS)
+    else:
+        die("mechanical_checks 必须提供 current_standard_gate；"
+            "旧三件套（platform_rules/delivery_contract/execution_path）仅作兼容")
+    for key in keys:
         value = mc.get(key)
         if not isinstance(value, str) or not value.strip():
             die(f"mechanical_checks.{key} 缺失")
-        if not _resolve_path(qa_dir, value).is_file():
+        p = _resolve_path(qa_dir, value)
+        if not p.is_file():
             die(f"mechanical_checks.{key} 指向的文件不存在：{value}")
+        paths[key] = p
+
+    for key in OPTIONAL_GATE_KEYS:
+        value = mc.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            die(f"mechanical_checks.{key} 为空")
+        p = _resolve_path(qa_dir, value)
+        if not p.is_file():
+            die(f"mechanical_checks.{key} 指向的文件不存在：{value}")
+        paths[key] = p
+
+    gate_passed: bool | None = None
+    if "current_standard_gate" in paths:
+        gate = _load_json(paths["current_standard_gate"], "current_standard_gate")
+        gate_passed = _gate_passed(gate)
+        if gate_passed is None:
+            die("current_standard_gate 产物里没有可判的二态结论（passed/ok/decision）")
+
+    shipping_ok: bool | None = None
+    if "shipping_limits" in paths:
+        obj = _load_json(paths["shipping_limits"], "shipping_limits")
+        shipping_ok = obj.get("ok") is not False
+    return gate_passed, shipping_ok
+
+
+def _gate_confirms_pass(gate_passed: bool | None, shipping_ok: bool | None) -> str | None:
+    """PASS 必须有两态门禁与体积检查撑腰；返回拒绝理由，None 表示可放行。"""
+    if gate_passed is False:
+        return "current_standard_gate 判定 FAIL，verdict 不得写 PASS"
+    if gate_passed is None:
+        return "PASS 需要 current_standard_gate 的二态产物作依据"
+    if shipping_ok is False:
+        return "shipping_limits 存在 fail 项（体积/快照源/凭证/架构），PASS 不成立"
+    if shipping_ok is None:
+        return "PASS 需要 shipping_limits 检查产物（scripts/check_shipping_limits.py）"
+    return None
 
 
 def _blocking_signatures(verdict: dict) -> list[str]:
@@ -316,9 +392,14 @@ def cmd_record_qa(args: argparse.Namespace) -> None:
         if not isinstance(item, str) or not _resolve_path(handoff_path.parent, item).exists():
             die(f"handoff.output_paths 指向不存在的文件：{item}")
 
-    decision = str(verdict.get("decision") or verdict.get("overall") or "").upper()
+    decision = str(verdict.get("decision") or verdict.get("overall") or "").strip().upper()
     if not decision:
-        die("verdict 缺少 decision/overall 字段")
+        die("verdict 缺少 decision 字段")
+    if decision in RETIRED_DECISIONS:
+        die(f"decision={decision} 已废止（v2.7 结论二态）：请写 PASS 或 FAIL；"
+            "覆盖不足属于本轮未完成，补齐后重交")
+    if decision not in DECISIONS:
+        die(f"未知 decision={decision}；只接受 PASS / FAIL")
     blocking = int(verdict.get("blocking_count", verdict.get("blocking", 0)) or 0)
     major = int(verdict.get("major_count", verdict.get("major", 0)) or 0)
     minor = int(verdict.get("minor_count", verdict.get("minor", 0)) or 0)
@@ -326,18 +407,25 @@ def cmd_record_qa(args: argparse.Namespace) -> None:
     signatures = _blocking_signatures(verdict)
     if signatures and blocking == 0:
         die("key_findings 含 blocking，但 blocking_count=0")
-    if decision in PASS_DECISIONS and (blocking > 0 or signatures):
-        die("decision=PASS* 不得含 blocking")
+    if decision == "PASS" and (blocking > 0 or signatures):
+        die("decision=PASS 不得含 blocking")
     if decision == "PASS" and major > 0:
-        die("decision=PASS 不得含 major；有 major 应记 PASS_WITH_WAIVERS")
+        die("decision=PASS 不得含 major（v2.7 无豁免档）：要紧就判 FAIL，不要紧记 minor")
+    if decision == "FAIL" and blocking == 0:
+        die("decision=FAIL 但 blocking_count=0：请给出至少一条可复现的 blocking 依据")
 
     qa_dir = verdict_path.parent
     shard_rows = _validate_shards(qa_dir, decision)
-    _validate_mechanical(verdict, qa_dir)
+    gate_passed, shipping_ok = _validate_mechanical(verdict, qa_dir)
+    if decision == "PASS":
+        reason = _gate_confirms_pass(gate_passed, shipping_ok)
+        if reason:
+            die(reason)
 
     entry = {
         "round": st["round"], "phase": "qa", "decision": decision,
         "blocking": blocking, "major": major, "minor": minor,
+        "gate_passed": gate_passed, "shipping_ok": shipping_ok,
         "blocking_signatures": signatures, "shards": shard_rows,
         "verdict_path": str(verdict_path), "handoff_path": str(handoff_path),
         "ts": now(),
@@ -421,6 +509,58 @@ def cmd_record_repair(args: argparse.Namespace) -> None:
     print(f"phase -> qa (round {nxt})")
 
 
+# --------------------------------------------------------------------------- gate
+def cmd_gate(args: argparse.Namespace) -> None:
+    """跑 v2.7 两态门禁 + 交付体积检查，产物写进本轮 qa/gates/。
+
+    门禁返回非零是**结论**，不是工具故障：照样写盘并打印 rc，交给人/下游判断。
+    """
+    root = Path(args.root).resolve() if args.root else Path(load_state_root())
+    st = load_state(root)
+    qa_dir = round_dir(root, st["round"]) / "qa"
+    gates = qa_dir / "gates"
+    gates.mkdir(parents=True, exist_ok=True)
+
+    skill = Path(args.skill_dir or st["skill_dir"]).resolve()
+    gate_py = skill / "scripts" / "current_standard_gate.py"
+    shipping_py = Path(__file__).resolve().parent / "scripts" / "check_shipping_limits.py"
+    task_root = Path(args.task_root).resolve()
+    extracted = Path(args.extracted).resolve() if args.extracted else qa_dir / "workspace" / "extracted"
+
+    if not gate_py.is_file():
+        die(f"找不到 skill 门禁脚本：{gate_py}（用 --skill-dir 或 AUTORESEARCH_QA_SKILL 指定）")
+    if not task_root.is_dir():
+        die(f"--task-root 不是目录：{task_root}")
+
+    runs = [
+        ("current_standard_gate", [sys.executable, "-B", str(gate_py),
+                                   "--root", str(task_root),
+                                   "--out", str(gates / "current-standard.json")]),
+        ("shipping_limits", [sys.executable, "-B", str(shipping_py),
+                             "--input", st["input_zip"],
+                             "--root", str(extracted),
+                             "--out", str(gates / "shipping-limits.json")]),
+    ]
+    failed = 0
+    for label, cmd in runs:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+        except OSError as exc:
+            die(f"{label} 无法启动：{exc}")
+        print(f"{label:24s} rc={proc.returncode}")
+        tail = (proc.stdout or "").strip().splitlines()[-5:]
+        for line in tail:
+            print(f"  {line}")
+        if proc.returncode != 0:
+            failed += 1
+            err = (proc.stderr or "").strip().splitlines()[-5:]
+            for line in err:
+                print(f"  ! {line}")
+    print(f"gates -> {gates}")
+    print(f"non-pass gates: {failed}（非零是结论，不是故障）")
+
+
 # --------------------------------------------------------------------------- stop / verify
 def cmd_stop(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve() if args.root else Path(load_state_root())
@@ -487,6 +627,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-rounds", type=int, default=3)
     p.add_argument("--shard-count", type=int, default=4)
     p.add_argument("--skill-dir", default=None)
+    p.add_argument("--standard", default="ee-qa-2.7.0+unified-qa-0.5.0-current.1",
+                   help="本轮执行的标准标识，写进 state.json")
     p.add_argument("--link", action="store_true", help="优先硬链接输入包，失败再复制")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_init)
@@ -503,6 +645,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--verdict", required=True)
     q.add_argument("--handoff", required=True)
     q.set_defaults(func=cmd_record_qa)
+
+    q = sub.add_parser("gate", help="跑 current_standard_gate 与交付体积检查")
+    q.add_argument("--root", default=None)
+    q.add_argument("--task-root", required=True, help="harbor_task 根目录")
+    q.add_argument("--extracted", default=None, help="解包树；默认 qa/workspace/extracted")
+    q.add_argument("--skill-dir", default=None, help="adversarial-engineering-qa 目录")
+    q.set_defaults(func=cmd_gate)
 
     q = sub.add_parser("record-repair")
     q.add_argument("--root", default=None)

@@ -4,10 +4,11 @@
   "type": "object",
   "required": ["schema_version", "task", "round", "phase", "input_zip", "input_sha256", "max_rounds"],
   "properties": {
-    "schema_version": {"type": "integer", "const": 1},
+    "schema_version": {"type": "integer", "const": 2},
     "task": {"type": "string"},
     "root": {"type": "string"},
-    "skill_dir": {"type": "string"},
+    "skill_dir": {"type": "string", "description": "adversarial-engineering-qa 目录，可被 AUTORESEARCH_QA_SKILL 覆盖"},
+    "standard": {"type": "string", "description": "本轮执行的标准标识，如 ee-qa-2.7.0 / unified-qa-0.5.0-current.1"},
     "max_rounds": {"type": "integer", "minimum": 1},
     "shard_count": {"type": "integer", "minimum": 1},
     "round": {"type": "integer", "minimum": 1},
