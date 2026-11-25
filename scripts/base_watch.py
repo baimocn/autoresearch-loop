@@ -1,76 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""base_watch.py —— 盯住飞书多维表格，变更时通过 bot 私聊推送告警。
+"""base_watch.py —— 盯住飞书出题表的「静态质检结果 + 终检结果」，变更时 bot 私聊告警。
 
-背景：平台改「结算公示表」后，专家需要在飞书里及时知道。
-飞书 CLI 的事件系统（lark-cli event list）没有 Base 记录变更事件，
-所以用**轮询 + manifest.rev 比对**：rev 变了才拉全表比对字段差异。
+目标（2026-11-25 用户确认）：
+  三期出题表 base = IPcOb7OlSadbxAsjUMvcZc3Wn1a
+    - tblHNtQNFPVwuKiP 三期领题表：auto0340 / auto2001 / auto2768
+    - tblZRCgkFlAMaUBy 三期专家自行选题表：AutoRe0823
+  字段：静态质检结果 / 静态质检状态 / 质检环节 / 终检结果 / 终检不通过原因 / 返修状态 等。
 
-读表用用户身份（有 base 权限），发消息用 bot 身份（有 im:message 权限），
-两者都是本机 lark-cli，不存任何 token。
+为什么轮询：飞书 CLI 事件系统没有 Base 记录变更事件（只有 IM/审批/任务等），
+所以用 manifest.rev 比对 + 字段 diff；只在真变化时推送，不变化完全静默。
+
+读表用用户身份，发消息用 bot 身份，均走本机 lark-cli，不存 token。
 
 用法：
-    # 1. 建立基线（第一次跑，不告警）
-    python scripts/base_watch.py --state /path/state.json snapshot
-
-    # 2. 之后每次轮询：只告警变化
-    python scripts/base_watch.py --state /path/state.json check --send
-
-    # 3. 看当前差异但不发送
-    python scripts/base_watch.py --state /path/state.json check
-
-    # 4. 配合 cron：每 5 分钟
-    */5 * * * * cd <repo> && python3 scripts/base_watch.py --state .base_watch.json check --send >> .base_watch.log 2>&1
-
-依赖：lark-cli 在 PATH 上；用户身份已授权 base 读取，bot 可发私聊。
+    python scripts/base_watch.py --state <state.json> snapshot     # 建基线，不告警
+    python scripts/base_watch.py --state <state.json> check [--send]
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
-# 结算公示表（来自飞书群 2026-11-24 公告的政策文档）
-DEFAULT_BASE = "UuOqbMBxCae9fdsu7e2cBjggnOf"
-DEFAULT_TABLE = "tbltCUxO9l58WLTY"
-DEFAULT_VIEW = "vewaBHqjsn"
-# 告警发给谁（用户 open_id，来自 lark-cli auth status）
+DEFAULT_BASE = "IPcOb7OlSadbxAsjUMvcZc3Wn1a"
+DEFAULT_TABLES = "tblHNtQNFPVwuKiP,tblZRCgkFlAMaUBy"  # 领题表 + 自行选题表
 DEFAULT_USER = "ou_f07842e37250cc424b9701edc6811707"
+TARGET_TASKS = ("auto0340", "auto2001", "auto2768", "auto0823")
 
-# 我们关心的字段：这些变了才告警；其他字段（如备注、申诉说明）变化不刷屏。
+# 只盯这些字段：静态/终检结果与状态、返修、打回原因、环节、轮次
 WATCH_FIELDS = (
-    "题目ID", "当前题目状态", "最优质检结果", "验收政策",
-    "结算批次", "金额确认", "题目结算价格", "结算总价格（不含高产激励）",
-    "是否选择结算", "一次成功", "早鸟激励", "统一追加返修激励",
-    "专家申诉说明", "主办方备注",
+    "当前质检轮次", "质检环节", "领取状态",
+    "静态质检状态", "静态质检结果", "静态质检未通过理由", "静态质检返修状态",
+    "终检结果", "终检不通过原因", "终检打回时间",
+    "返修状态", "是否完成", "是否入库", "申诉回复",
 )
 FIELD_LABEL = {
-    "当前题目状态": "状态", "最优质检结果": "质检", "验收政策": "验收",
-    "结算批次": "批次", "金额确认": "金额确认", "题目结算价格": "结算价",
-    "结算总价格（不含高产激励）": "总价", "是否选择结算": "选择结算",
-    "一次成功": "一次成功", "早鸟激励": "早鸟",
-    "统一追加返修激励": "返修激励", "专家申诉说明": "申诉说明", "主办方备注": "平台备注",
+    "当前质检轮次": "轮次", "质检环节": "环节", "领取状态": "领取",
+    "静态质检状态": "静态状态", "静态质检结果": "静态结果",
+    "静态质检未通过理由": "静态未过理由", "静态质检返修状态": "静态返修",
+    "终检结果": "终检结果", "终检不通过原因": "终检原因",
+    "终检打回时间": "终检打回", "返修状态": "返修状态",
+    "是否完成": "完成", "是否入库": "入库", "申诉回复": "申诉回复",
 }
 
 
 def lark(*args: str, as_user: str = "user", expect_envelope: bool = True) -> dict:
-    """跑 lark-cli 并解析 JSON；失败抛异常，不吞错。
-
-    expect_envelope=False 用于 +record-list --format ndjson：它直接打印 manifest，
-    没有 ok 信封，成功与否只看 rc。
-    """
     cmd = ["lark-cli", *args, "--as", as_user, "--json"]
     proc = subprocess.run(cmd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     try:
         data = json.loads(proc.stdout)
     except ValueError as exc:
-        raise RuntimeError(f"lark-cli 输出无法解析: {exc}\n{proc.stdout[:500]}\n{proc.stderr[:500]}") from exc
+        raise RuntimeError(f"lark-cli 输出无法解析: {exc}\n{proc.stdout[:400]}\n{proc.stderr[:400]}") from exc
     if proc.returncode != 0:
         err = data.get("error", {}) if isinstance(data, dict) else {}
         raise RuntimeError(f"lark-cli 调用失败 (rc={proc.returncode}): "
@@ -81,38 +67,48 @@ def lark(*args: str, as_user: str = "user", expect_envelope: bool = True) -> dic
     return data
 
 
-def fetch_snapshot(base: str, table: str, view: str | None) -> dict:
-    """拉表并读 manifest.rev + 记录，返回可比较的快照。"""
-    with tempfile.TemporaryDirectory(prefix="base_watch_") as td:
-        out = str(Path(td) / "records.ndjson")
-        args = ["base", "+record-list", "--base-token", base,
-                "--table-id", table, "--format", "ndjson",
-                "--output", out, "--overwrite"]
-        if view:
-            args += ["--view-id", view]
-        manifest = lark(*args, expect_envelope=False)
-        # manifest 由 stdout 返回，同时落盘为 records.manifest.json
-        rows = [json.loads(line) for line in Path(out).read_text(encoding="utf-8").splitlines() if line.strip()]
-
-    by_task: dict[str, dict] = {}
-    for row in rows:
-        task = str(row.get("题目ID") or row.get("record_id") or "?")
-        by_task[task] = {
-            key: normalize(row.get(key))
-            for key in WATCH_FIELDS if key in row
-        }
-    return {"rev": manifest.get("rev"), "rows": by_task, "fetched_at": now()}
-
-
 def normalize(value) -> str:
-    """把列表/数字/None 归一成可比较、可读的字符串。"""
     if value is None or value == "" or value == []:
         return ""
     if isinstance(value, list):
         return "/".join(str(x) for x in value)
     if isinstance(value, bool):
         return "是" if value else "否"
-    return str(value)
+    return str(value).replace("\n", " ")
+
+
+def task_name(value) -> str:
+    """把 AutoRe0823 / autore0823 / auto0823 都归一成 auto0823。"""
+    s = str(value or "").strip().lower().replace("autore", "auto")
+    return s
+
+
+def fetch_snapshot(base: str, tables: list[str]) -> dict:
+    """拉所有表，只保留4道目标题的质检字段；rev 取各表 rev 的组合。"""
+    rows: dict[str, dict] = {}
+    revs: dict[str, int] = {}
+    with tempfile.TemporaryDirectory(prefix="base_watch_") as td:
+        for tbl in tables:
+            out = str(Path(td) / f"{tbl}.ndjson")
+            manifest = lark("base", "+record-list", "--base-token", base,
+                            "--table-id", tbl, "--format", "ndjson",
+                            "--output", out, "--overwrite", expect_envelope=False)
+            revs[tbl] = int(manifest.get("rev") or 0)
+            for line in Path(out).read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                raw = rec.get("题号（例如AutoRe0001）") or rec.get("题号") or ""
+                name = task_name(raw)
+                if name not in TARGET_TASKS:
+                    continue
+                # 两道题号写法不同：归一展示，但保留原值以防混淆
+                rows[name] = {
+                    "_display": str(raw),
+                    "_table": tbl,
+                    **{k: normalize(rec.get(k)) for k in WATCH_FIELDS if k in rec},
+                }
+    return {"revs": revs, "rows": rows, "fetched_at": now()}
 
 
 def now() -> str:
@@ -120,30 +116,43 @@ def now() -> str:
 
 
 def diff(old: dict, new: dict) -> list[str]:
-    """返回人类可读的变更行；只比 WATCH_FIELDS。"""
-    lines: list[str] = []
     old_rows = old.get("rows", {})
     new_rows = new.get("rows", {})
-    for task in sorted(set(old_rows) | set(new_rows)):
+    lines: list[str] = []
+    for task in TARGET_TASKS:
         before = old_rows.get(task)
         after = new_rows.get(task)
+        if before is None and after is None:
+            continue
+        label_task = (after or before).get("_display", task)
         if before is None:
-            lines.append(f"🆕 **{task}** 新增记录")
+            lines.append(f"🆕 **{label_task}** 出现在质检表中")
             continue
         if after is None:
-            lines.append(f"❌ **{task}** 记录被删除")
+            lines.append(f"❌ **{label_task}** 从质检表中消失")
             continue
         changes = []
         for key in WATCH_FIELDS:
             b = before.get(key, "")
             a = after.get(key, "")
             if b != a:
-                label = FIELD_LABEL.get(key, key)
-                changes.append(f"  - {label}: `{b or '空'}` → `{a or '空'}`")
+                # 终检原因可能很长，截断到 200 字符避免刷屏
+                bb = b if len(b) <= 200 else b[:200] + "…"
+                aa = a if len(a) <= 200 else a[:200] + "…"
+                changes.append(f"  - {FIELD_LABEL.get(key, key)}: `{bb or '空'}` → `{aa or '空'}`")
         if changes:
-            lines.append(f"🔄 **{task}**")
+            lines.append(f"🔄 **{label_task}**")
             lines.extend(changes)
     return lines
+
+
+def rev_summary(old: dict, new: dict) -> str:
+    parts = []
+    for tbl in sorted(set(old.get("revs", {})) | set(new.get("revs", {}))):
+        o = old.get("revs", {}).get(tbl)
+        n = new.get("revs", {}).get(tbl)
+        parts.append(f"{tbl[-6:]}:{o}→{n}")
+    return ", ".join(parts)
 
 
 def load_state(path: Path) -> dict | None:
@@ -166,47 +175,34 @@ def send_message(text: str, user: str) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="飞书表格变更 → bot 私聊告警")
-    ap.add_argument("action", choices=("snapshot", "check"),
-                    help="snapshot=建基线不告警；check=比对并（可选）告警")
-    ap.add_argument("--state", required=True, help="状态文件路径（存上次快照）")
+    ap = argparse.ArgumentParser(description="4 题质检结果变更 → bot 私聊告警")
+    ap.add_argument("action", choices=("snapshot", "check"))
+    ap.add_argument("--state", required=True)
     ap.add_argument("--base", default=DEFAULT_BASE)
-    ap.add_argument("--table", default=DEFAULT_TABLE)
-    ap.add_argument("--view", default=DEFAULT_VIEW, help="留空 '' 表示读全部记录")
-    ap.add_argument("--user", default=DEFAULT_USER, help="告警接收人 open_id")
-    ap.add_argument("--send", action="store_true", help="check 时真的发消息（默认只打印）")
+    ap.add_argument("--tables", default=DEFAULT_TABLES, help="逗号分隔的表 ID")
+    ap.add_argument("--user", default=DEFAULT_USER)
+    ap.add_argument("--send", action="store_true")
     args = ap.parse_args()
 
-    state_path = Path(args.state).resolve()
-    new = fetch_snapshot(args.base, args.table, args.view or None)
-    old = load_state(state_path)
+    tables = [t.strip() for t in args.tables.split(",") if t.strip()]
+    new = fetch_snapshot(args.base, tables)
+    old = load_state(Path(args.state).resolve())
 
-    if args.action == "snapshot":
-        save_state(state_path, new)
-        print(f"baseline saved: rev={new['rev']} tasks={len(new['rows'])} -> {state_path}")
-        return 0
-
-    if old is None:
-        save_state(state_path, new)
-        print(f"no baseline found; created one: rev={new['rev']}")
+    if args.action == "snapshot" or old is None:
+        save_state(Path(args.state).resolve(), new)
+        print(f"baseline: revs={new['revs']} tasks={sorted(new['rows'])}")
         return 0
 
     changes = diff(old, new)
-    rev_changed = old.get("rev") != new.get("rev")
-    print(f"check {now()}: rev {old.get('rev')} -> {new.get('rev')} "
-          f"(changed={rev_changed}), field changes={len(changes)}")
-
+    print(f"check {now()}: revs {rev_summary(old, new)}, changes={len(changes)}")
     if changes:
-        header = f"【结算表变更告警】{now()}\n修订号 rev {old.get('rev')} → {new.get('rev')}\n"
-        text = header + "\n".join(changes)
+        text = ("【4题质检结果变更告警】" + now() + "\n"
+                + rev_summary(old, new) + "\n" + "\n".join(changes))
         print(text)
         if args.send:
-            result = send_message(text, args.user)
-            print(f"sent: message_id={result.get('data', {}).get('message_id')}")
-    elif rev_changed:
-        print("rev 变化但关注字段无差异（可能是视图/排序调整），不告警。")
-
-    save_state(state_path, new)
+            res = send_message(text, args.user)
+            print(f"sent: message_id={res.get('data', {}).get('message_id')}")
+    save_state(Path(args.state).resolve(), new)
     return 0
 
 

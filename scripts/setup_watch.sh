@@ -21,7 +21,7 @@ scp -r ~/.local/share/lark-cli/. "$SERVER:~/.local/share/lark-cli/"
 
 echo "=== 3/5 服务器端校验授权 ==="
 # 真正的验证是实际读一次表；auth status 的 verified 字段只在 --verify 时出现。
-if ! ssh "$SERVER" "export PATH=/usr/local/bin:\$PATH; lark-cli base +record-list --base-token UuOqbMBxCae9fdsu7e2cBjggnOf --table-id tbltCUxO9l58WLTY --as user --format json --limit 1 --json" | python3 -c "
+if ! ssh "$SERVER" "export PATH=/usr/local/bin:\$PATH; lark-cli base +record-list --base-token IPcOb7OlSadbxAsjUMvcZc3Wn1a --table-id tblHNtQNFPVwuKiP --as user --format json --limit 1 --json" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 ok = d.get('ok') is True
