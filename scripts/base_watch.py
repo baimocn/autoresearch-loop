@@ -3,9 +3,9 @@
 """base_watch.py —— 盯住飞书出题表的「静态质检结果 + 终检结果」，变更时 bot 私聊告警。
 
 目标（2026-11-25 用户确认）：
-  三期出题表 base = IPcOb7OlSadbxAsjUMvcZc3Wn1a
-    - tblHNtQNFPVwuKiP 三期领题表：auto0340 / auto2001 / auto2768
-    - tblZRCgkFlAMaUBy 三期专家自行选题表：AutoRe0823
+  三期出题表 base 经环境变量 WATCH_BASE_TOKEN 注入（或 --base 参数），表 ID 经 WATCH_TABLES 注入（或 --tables 参数）
+    - 三期领题表：auto0340 / auto2001 / auto2768
+    - 三期专家自行选题表：AutoRe0823
   字段：静态质检结果 / 静态质检状态 / 质检环节 / 终检结果 / 终检不通过原因 / 返修状态 等。
 
 为什么轮询：飞书 CLI 事件系统没有 Base 记录变更事件（只有 IM/审批/任务等），
@@ -21,15 +21,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_BASE = "IPcOb7OlSadbxAsjUMvcZc3Wn1a"
-DEFAULT_TABLES = "tblHNtQNFPVwuKiP,tblZRCgkFlAMaUBy"  # 领题表 + 自行选题表
-DEFAULT_USER = "ou_f07842e37250cc424b9701edc6811707"
+DEFAULT_BASE = os.environ.get("WATCH_BASE_TOKEN", "")
+DEFAULT_TABLES = os.environ.get("WATCH_TABLES", "")  # 逗号分隔：领题表,自行选题表
+DEFAULT_USER = os.environ.get("WATCH_USER_ID", "")
 TARGET_TASKS = ("auto0340", "auto2001", "auto2768", "auto0823")
 
 # 只盯这些字段：静态/终检结果与状态、返修、打回原因、环节、轮次
@@ -183,6 +184,12 @@ def main() -> int:
     ap.add_argument("--user", default=DEFAULT_USER)
     ap.add_argument("--send", action="store_true")
     args = ap.parse_args()
+    missing = [name for name, val in (
+        ("--base/WATCH_BASE_TOKEN", args.base),
+        ("--tables/WATCH_TABLES", args.tables),
+        ("--user/WATCH_USER_ID", args.user)) if not val]
+    if missing:
+        ap.error("缺少必填参数（命令行参数或环境变量）: " + ", ".join(missing))
 
     tables = [t.strip() for t in args.tables.split(",") if t.strip()]
     new = fetch_snapshot(args.base, tables)
